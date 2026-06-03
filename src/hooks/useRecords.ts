@@ -10,7 +10,8 @@ import {
   loadDataFromCloud,
   subscribeCloud,
   setSyncCode,
-  getSyncCode
+  getSyncCode,
+  createSyncBlob
 } from '../services/syncService';
 
 const INITIAL_DATA = `5.11	9:38	21:07
@@ -92,23 +93,26 @@ export function useRecords() {
 
       if (loadedSettings.syncCode) {
         setSyncStatus('syncing');
-        try {
-          const cloud = await loadDataFromCloud();
-          if (cloud && cloud.records && cloud.records.length > 0) {
-            // 云端有数据：以云端为准
-            setRecords(cloud.records);
-            saveRecords(cloud.records);
+        const cloud = await loadDataFromCloud();
+        if (cloud) {
+          // 比较时间戳：如果云端比本地"更新过"，用云端
+          const localUpdated = parseInt(localStorage.getItem('attendance_local_updated_ms') || '0');
+          if (cloud.updatedAtMs > localUpdated) {
+            if (Array.isArray(cloud.records) && cloud.records.length > 0) {
+              setRecords(cloud.records);
+              saveRecords(cloud.records);
+            }
             if (cloud.settings) {
               const merged = { ...cloud.settings, syncCode: loadedSettings.syncCode };
               setSettings(merged);
               saveSettingsToLocal(merged);
             }
           } else {
-            // 云端为空：把本地数据上传
+            // 本地更新，推上去
             syncDataToCloud(baseRecords, loadedSettings);
           }
           setSyncStatus('synced');
-        } catch {
+        } else {
           setSyncStatus('offline');
         }
       }
@@ -118,7 +122,7 @@ export function useRecords() {
     init();
   }, []);
 
-  // 当 syncCode 变化时，重新订阅
+  // 订阅云端轮询
   useEffect(() => {
     if (!initialized) return;
     if (unsubRef.current) {
@@ -126,20 +130,18 @@ export function useRecords() {
       unsubRef.current = null;
     }
     if (settings.syncCode) {
-      unsubRef.current = subscribeCloud(({ records: rRecs, settings: rSettings, updatedAtMs }) => {
-        // 忽略 1.5s 内本地刚刚 push 上去的数据回放
-        if (Date.now() - lastLocalUpdateRef.current < 1500) return;
-        if (Array.isArray(rRecs)) {
-          setRecords(rRecs);
-          saveRecords(rRecs);
+      unsubRef.current = subscribeCloud((data) => {
+        if (Date.now() - lastLocalUpdateRef.current < 2000) return;
+        if (Array.isArray(data.records)) {
+          setRecords(data.records);
+          saveRecords(data.records);
         }
-        if (rSettings) {
-          const merged = { ...rSettings, syncCode: settings.syncCode };
+        if (data.settings) {
+          const merged = { ...data.settings, syncCode: settings.syncCode };
           setSettings(merged);
           saveSettingsToLocal(merged);
         }
         setSyncStatus('synced');
-        void updatedAtMs;
       });
     }
     return () => {
@@ -154,10 +156,11 @@ export function useRecords() {
     saveRecords(newRecords);
     saveSettingsToLocal(newSettings);
     lastLocalUpdateRef.current = Date.now();
+    localStorage.setItem('attendance_local_updated_ms', String(lastLocalUpdateRef.current));
     if (newSettings.syncCode) {
       setSyncStatus('syncing');
       syncDataToCloud(newRecords, newSettings);
-      setTimeout(() => setSyncStatus('synced'), 600);
+      setTimeout(() => setSyncStatus('synced'), 800);
     }
   }, []);
 
@@ -178,7 +181,6 @@ export function useRecords() {
   const updateRecord = useCallback((id: string, checkOut: string) => {
     const record = records.find(r => r.id === id);
     if (!record || !record.checkIn) return null;
-
     const duration = calculateDuration(record.checkIn, checkOut);
     const updated = records.map(r =>
       r.id === id ? { ...r, checkOut, duration } : r
@@ -206,34 +208,64 @@ export function useRecords() {
     persist(updated, settings);
   }, [records, settings, persist]);
 
-  const updateSettings = useCallback((newSettings: AppSettings) => {
-    const codeChanged = newSettings.syncCode !== settings.syncCode;
-    setSettings(newSettings);
-    setSyncCode(newSettings.syncCode || '');
-    saveSettingsToLocal(newSettings);
-    if (codeChanged && newSettings.syncCode) {
-      // 切换/启用同步码：先尝试拉云端
-      (async () => {
-        setSyncStatus('syncing');
-        const cloud = await loadDataFromCloud();
-        if (cloud && cloud.records && cloud.records.length > 0) {
-          setRecords(cloud.records);
-          saveRecords(cloud.records);
-          if (cloud.settings) {
-            const merged = { ...cloud.settings, syncCode: newSettings.syncCode };
-            setSettings(merged);
-            saveSettingsToLocal(merged);
-          }
-        } else {
-          // 云端没有：把本地推上去
-          syncDataToCloud(records, newSettings);
-        }
-        setSyncStatus('synced');
-      })();
-    } else {
-      persist(records, newSettings);
+  /** 创建一个新的云端同步空间（A 设备调用），返回 syncCode */
+  const enableNewSync = useCallback(async (): Promise<string | null> => {
+    setSyncStatus('syncing');
+    const code = await createSyncBlob(records, { ...settings, syncCode: '' });
+    if (!code) {
+      setSyncStatus('offline');
+      return null;
     }
-  }, [records, settings, persist]);
+    setSyncCode(code);
+    const merged = { ...settings, syncCode: code };
+    setSettings(merged);
+    saveSettingsToLocal(merged);
+    setSyncStatus('synced');
+    return code;
+  }, [records, settings]);
+
+  /** 加入已有的同步空间（B 设备调用） */
+  const joinSync = useCallback(async (code: string): Promise<boolean> => {
+    const trimmed = code.trim();
+    if (!trimmed) return false;
+    setSyncCode(trimmed);
+    setSyncStatus('syncing');
+    const merged = { ...settings, syncCode: trimmed };
+    setSettings(merged);
+    saveSettingsToLocal(merged);
+
+    const cloud = await loadDataFromCloud();
+    if (!cloud) {
+      setSyncStatus('offline');
+      return false;
+    }
+    if (Array.isArray(cloud.records) && cloud.records.length >= 0) {
+      setRecords(cloud.records);
+      saveRecords(cloud.records);
+    }
+    if (cloud.settings) {
+      const merged2 = { ...cloud.settings, syncCode: trimmed };
+      setSettings(merged2);
+      saveSettingsToLocal(merged2);
+    }
+    setSyncStatus('synced');
+    return true;
+  }, [settings]);
+
+  /** 断开同步 */
+  const disableSync = useCallback(() => {
+    setSyncCode('');
+    const merged = { ...settings, syncCode: '' };
+    setSettings(merged);
+    saveSettingsToLocal(merged);
+    setSyncStatus('idle');
+  }, [settings]);
+
+  const updateSettings = useCallback((newSettings: AppSettings) => {
+    setSettings(newSettings);
+    saveSettingsToLocal(newSettings);
+    persist(records, newSettings);
+  }, [records, persist]);
 
   const getTodayRecord = useCallback(() => {
     const today = getCurrentDate();
@@ -264,6 +296,9 @@ export function useRecords() {
     getTodayRecord,
     importRecords,
     updateSettings,
+    enableNewSync,
+    joinSync,
+    disableSync,
     currentSyncCode: getSyncCode()
   };
 }
