@@ -1,25 +1,49 @@
 import { Record } from '../types';
 import { getCurrentDate, getWeekDateRange, getWeekDay } from './time';
 
-export function calculateWeeklyStats(records: Record[], weekStr: string): {
+function addDays(dateStr: string, n: number): string {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const date = new Date(y, m - 1, d);
+  date.setDate(date.getDate() + n);
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
+/** 周内第 i 天（0=周一）是否为工作日 */
+function isWorkdayIndex(i: number, workDaysPerWeek: number): boolean {
+  return i < workDaysPerWeek;
+}
+
+export function calculateWeeklyStats(
+  records: Record[],
+  weekStr: string,
+  workDaysPerWeek: number = 5
+): {
   totalMinutes: number;
   daysWithData: number;
   remainingDays: number;
   completedDates: Set<string>;
 } {
   const weekRange = getWeekDateRange(weekStr);
+  // 仅统计本周工作日的记录（避免周六周日临时打卡污染）
+  const workdayDates = new Set<string>();
+  for (let i = 0; i < 7; i++) {
+    if (isWorkdayIndex(i, workDaysPerWeek)) {
+      workdayDates.add(addDays(weekRange.start, i));
+    }
+  }
+
   const weekRecords = records.filter(r =>
-    r.date >= weekRange.start && r.date <= weekRange.end && r.duration !== null
+    workdayDates.has(r.date) && r.duration !== null
   );
 
   const totalMinutes = weekRecords.reduce((sum, r) => sum + (r.duration || 0), 0);
   const daysWithData = weekRecords.length;
-
   const completedDates = new Set(weekRecords.filter(r => r.checkOut).map(r => r.date));
 
   const today = getCurrentDate();
   let remainingDays = 0;
   for (let i = 0; i < 7; i++) {
+    if (!isWorkdayIndex(i, workDaysPerWeek)) continue;
     const dateStr = addDays(weekRange.start, i);
     if (dateStr >= today && !completedDates.has(dateStr)) {
       remainingDays++;
@@ -51,55 +75,51 @@ export function formatMinutes(minutes: number): string {
   return `${sign}${hours}小时${mins}分钟`;
 }
 
-function addDays(dateStr: string, n: number): string {
-  const [y, m, d] = dateStr.split('-').map(Number);
-  const date = new Date(y, m - 1, d);
-  date.setDate(date.getDate() + n);
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
-}
-
 export interface DayPlan {
   date: string;
   weekday: string;
   isToday: boolean;
   isFuture: boolean;
-  checkIn: string | null;          // 已 checkIn 或预计上班
+  isWorkday: boolean;
+  checkIn: string | null;
   suggestedCheckOut: string | null;
-  requiredMinutes: number;          // 这一天需要工作多少分钟
+  requiredMinutes: number;
 }
 
-/**
- * 计算从今天起本周剩余每一天的下班时间建议
- * @param records 历史记录
- * @param weekStr 周标识，如 2026-W23
- * @param targetHours 周目标小时
- * @param plannedCheckIns 用户为未来某些天预设的上班时间 { 'YYYY-MM-DD': '09:30' }
- */
 export function calculateRemainingPlan(
   records: Record[],
   weekStr: string,
   targetHours: number,
-  plannedCheckIns: Record_PlannedMap = {}
+  plannedCheckIns: Record_PlannedMap = {},
+  workDaysPerWeek: number = 5
 ): { plan: DayPlan[]; totalRemainingMinutes: number; perDayMinutes: number; defaultCheckIn: string } {
   const today = getCurrentDate();
   const range = getWeekDateRange(weekStr);
   const targetMinutes = Math.round(targetHours * 60);
 
-  // 已完成（有 duration）那部分时间
+  const workdayDates = new Set<string>();
+  for (let i = 0; i < 7; i++) {
+    if (isWorkdayIndex(i, workDaysPerWeek)) {
+      workdayDates.add(addDays(range.start, i));
+    }
+  }
+
+  // 仅统计工作日已完成的时间
   const weekRecords = records.filter(r =>
     r.date >= range.start && r.date <= range.end
   );
   const completedMinutes = weekRecords
-    .filter(r => r.duration != null && r.checkOut)
+    .filter(r => r.duration != null && r.checkOut && workdayDates.has(r.date))
     .reduce((s, r) => s + (r.duration || 0), 0);
 
-  // 收集需要规划的天（今天 + 之后）
+  // 仅工作日中需要规划的天（今天 + 之后，且未下班）
   const remainingDates: string[] = [];
   for (let i = 0; i < 7; i++) {
+    if (!isWorkdayIndex(i, workDaysPerWeek)) continue;
     const ds = addDays(range.start, i);
     if (ds < today) continue;
     const rec = weekRecords.find(r => r.date === ds);
-    if (rec && rec.checkOut) continue; // 已下班的跳过
+    if (rec && rec.checkOut) continue;
     remainingDates.push(ds);
   }
 
@@ -108,7 +128,7 @@ export function calculateRemainingPlan(
     ? Math.round(remainingMinutes / remainingDates.length)
     : 0;
 
-  // 默认上班时间：用最近 7 个工作日 checkIn 平均
+  // 默认上班时间：最近 7 个工作日 checkIn 平均
   const recent = records
     .filter(r => r.checkIn)
     .slice(0, 7)
@@ -127,13 +147,9 @@ export function calculateRemainingPlan(
     const isFuture = ds > today;
 
     let checkIn: string | null = null;
-    if (rec?.checkIn) {
-      checkIn = rec.checkIn;
-    } else if (plannedCheckIns[ds]) {
-      checkIn = plannedCheckIns[ds];
-    } else if (isFuture) {
-      checkIn = defaultCheckIn;
-    }
+    if (rec?.checkIn) checkIn = rec.checkIn;
+    else if (plannedCheckIns[ds]) checkIn = plannedCheckIns[ds];
+    else if (isFuture) checkIn = defaultCheckIn;
 
     let suggestedCheckOut: string | null = null;
     if (checkIn && perDayMinutes > 0) {
@@ -145,6 +161,7 @@ export function calculateRemainingPlan(
       weekday: getWeekDay(ds),
       isToday,
       isFuture,
+      isWorkday: true,
       checkIn,
       suggestedCheckOut,
       requiredMinutes: perDayMinutes

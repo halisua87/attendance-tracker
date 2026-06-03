@@ -8,11 +8,13 @@ const SYNC_CODE_KEY = 'attendance_sync_code';
 export interface AppSettings {
   weeklyTargetHours: number;
   syncCode: string;
+  workDaysPerWeek: number; // 本周需上班的天数，默认 5
 }
 
 const DEFAULT_SETTINGS: AppSettings = {
   weeklyTargetHours: 40,
-  syncCode: ''
+  syncCode: '',
+  workDaysPerWeek: 5
 };
 
 export function getSyncCode(): string {

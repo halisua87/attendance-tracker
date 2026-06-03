@@ -34,6 +34,7 @@ function savePlanned(map: Record_PlannedMap) {
 export function TargetGoal({ records, settings, syncStatus = 'idle', onSettingsChange }: TargetGoalProps) {
   const [isEditing, setIsEditing] = useState(false);
   const [tempTarget, setTempTarget] = useState(settings.weeklyTargetHours.toString());
+  const [tempWorkDays, setTempWorkDays] = useState((settings.workDaysPerWeek ?? 5).toString());
   const [showSync, setShowSync] = useState(false);
   const [tempCode, setTempCode] = useState(settings.syncCode || '');
   const [planned, setPlanned] = useState<Record_PlannedMap>(loadPlanned());
@@ -43,10 +44,14 @@ export function TargetGoal({ records, settings, syncStatus = 'idle', onSettingsC
     setTempCode(settings.syncCode || '');
   }, [settings.syncCode]);
 
-  const stats = useMemo(() => calculateWeeklyStats(records, currentWeek), [records, currentWeek]);
+  const workDays = settings.workDaysPerWeek ?? 5;
+  const stats = useMemo(
+    () => calculateWeeklyStats(records, currentWeek, workDays),
+    [records, currentWeek, workDays]
+  );
   const planResult = useMemo(
-    () => calculateRemainingPlan(records, currentWeek, settings.weeklyTargetHours, planned),
-    [records, currentWeek, settings.weeklyTargetHours, planned]
+    () => calculateRemainingPlan(records, currentWeek, settings.weeklyTargetHours, planned, workDays),
+    [records, currentWeek, settings.weeklyTargetHours, planned, workDays]
   );
 
   const targetMinutes = settings.weeklyTargetHours * 60;
@@ -59,14 +64,18 @@ export function TargetGoal({ records, settings, syncStatus = 'idle', onSettingsC
 
   const handleSaveTarget = () => {
     const newTarget = parseFloat(tempTarget);
-    if (!isNaN(newTarget) && newTarget > 0) {
-      onSettingsChange({ ...settings, weeklyTargetHours: newTarget });
-      setIsEditing(false);
-    }
+    const newWorkDays = parseInt(tempWorkDays);
+    const next: AppSettings = { ...settings };
+    if (!isNaN(newTarget) && newTarget > 0) next.weeklyTargetHours = newTarget;
+    if (!isNaN(newWorkDays) && newWorkDays >= 1 && newWorkDays <= 7) next.workDaysPerWeek = newWorkDays;
+    onSettingsChange(next);
+    setIsEditing(false);
   };
   const handleQuickTarget = (h: number) => {
-    onSettingsChange({ ...settings, weeklyTargetHours: h });
     setTempTarget(h.toString());
+  };
+  const handleQuickWorkDays = (d: number) => {
+    setTempWorkDays(d.toString());
   };
 
   const handleSaveSync = () => {
@@ -110,60 +119,106 @@ export function TargetGoal({ records, settings, syncStatus = 'idle', onSettingsC
             {syncStatus === 'syncing' && <RefreshCw className="w-3 h-3 animate-spin" />}
             <span>{settings.syncCode ? `已连接: ${settings.syncCode}` : '设置云同步'}</span>
           </button>
-          {!isEditing ? (
-            <button
-              onClick={() => {
-                setTempTarget(settings.weeklyTargetHours.toString());
-                setIsEditing(true);
-              }}
-              className="px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg text-sm font-semibold transition-all"
-            >
-              编辑目标
-            </button>
-          ) : (
-            <div className="flex items-center gap-2">
+          <button
+            onClick={() => {
+              setTempTarget(settings.weeklyTargetHours.toString());
+              setTempWorkDays((settings.workDaysPerWeek ?? 5).toString());
+              setIsEditing(v => !v);
+            }}
+            className={`px-4 py-2 rounded-lg text-sm font-semibold transition-all ${
+              isEditing ? 'bg-purple-100 text-purple-700' : 'bg-gray-100 hover:bg-gray-200 text-gray-700'
+            }`}
+          >
+            {isEditing ? '收起' : '编辑目标'}
+          </button>
+        </div>
+      </div>
+
+      {/* 编辑面板 */}
+      {isEditing && (
+        <div className="mb-6 p-5 rounded-xl bg-gradient-to-br from-purple-50 to-pink-50 border border-purple-100 space-y-5">
+          <div>
+            <label className="block text-sm font-semibold text-gray-700 mb-2">
+              本周目标时长（小时）
+            </label>
+            <div className="flex items-center gap-3 mb-3">
               <input
                 type="number"
                 step="0.5"
                 min="1"
                 value={tempTarget}
                 onChange={(e) => setTempTarget(e.target.value)}
-                className="w-20 px-3 py-2 border-2 border-gray-200 rounded-lg text-center focus:outline-none focus:ring-2 focus:ring-purple-200 focus:border-purple-500"
+                className="w-28 px-3 py-2 border-2 border-gray-200 rounded-lg text-center text-lg font-mono focus:outline-none focus:ring-2 focus:ring-purple-200 focus:border-purple-500"
               />
-              <span className="text-gray-500 text-sm">小时</span>
-              <button
-                onClick={handleSaveTarget}
-                className="px-3 py-2 bg-gradient-to-r from-purple-500 to-pink-600 text-white rounded-lg text-sm font-semibold hover:from-purple-600 hover:to-pink-700 transition-all"
-              >
-                保存
-              </button>
-              <button
-                onClick={() => setIsEditing(false)}
-                className="px-3 py-2 bg-gray-200 text-gray-700 rounded-lg text-sm font-semibold hover:bg-gray-300 transition-all"
-              >
-                取消
-              </button>
+              <span className="text-gray-500">小时</span>
             </div>
-          )}
-        </div>
-      </div>
+            <div className="flex flex-wrap gap-2">
+              {QUICK_TARGETS.map(h => (
+                <button
+                  key={h}
+                  onClick={() => handleQuickTarget(h)}
+                  className={`px-3 py-1.5 rounded-lg text-sm font-semibold transition-all border-2 ${
+                    Math.abs(parseFloat(tempTarget) - h) < 0.01
+                      ? 'bg-purple-600 text-white border-purple-600'
+                      : 'bg-white text-gray-700 border-gray-200 hover:border-purple-400'
+                  }`}
+                >
+                  {h}h
+                </button>
+              ))}
+            </div>
+          </div>
 
-      {/* 快速选目标 */}
-      {isEditing && (
-        <div className="mb-4 flex flex-wrap gap-2">
-          {QUICK_TARGETS.map(h => (
+          <div>
+            <label className="block text-sm font-semibold text-gray-700 mb-2">
+              本周上班天数（周一开始计入工作日）
+            </label>
+            <div className="flex items-center gap-3 mb-3">
+              <input
+                type="number"
+                step="1"
+                min="1"
+                max="7"
+                value={tempWorkDays}
+                onChange={(e) => setTempWorkDays(e.target.value)}
+                className="w-28 px-3 py-2 border-2 border-gray-200 rounded-lg text-center text-lg font-mono focus:outline-none focus:ring-2 focus:ring-purple-200 focus:border-purple-500"
+              />
+              <span className="text-gray-500">天</span>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {[3, 4, 5, 6, 7].map(d => (
+                <button
+                  key={d}
+                  onClick={() => handleQuickWorkDays(d)}
+                  className={`px-3 py-1.5 rounded-lg text-sm font-semibold transition-all border-2 ${
+                    parseInt(tempWorkDays) === d
+                      ? 'bg-purple-600 text-white border-purple-600'
+                      : 'bg-white text-gray-700 border-gray-200 hover:border-purple-400'
+                  }`}
+                >
+                  {d}天
+                </button>
+              ))}
+            </div>
+            <p className="mt-2 text-xs text-gray-500">
+              说明：默认周一到周五，设为 6 则周六也算工作日，依此类推；周末/非工作日的打卡时间不计入本周目标统计与剩余天数。
+            </p>
+          </div>
+
+          <div className="flex gap-3 pt-1">
             <button
-              key={h}
-              onClick={() => handleQuickTarget(h)}
-              className={`px-3 py-1.5 rounded-lg text-sm font-semibold transition-all border-2 ${
-                Math.abs(settings.weeklyTargetHours - h) < 0.01
-                  ? 'bg-purple-600 text-white border-purple-600'
-                  : 'bg-white text-gray-700 border-gray-200 hover:border-purple-400'
-              }`}
+              onClick={handleSaveTarget}
+              className="flex-1 px-4 py-2.5 bg-gradient-to-r from-purple-500 to-pink-600 text-white rounded-lg font-semibold hover:from-purple-600 hover:to-pink-700 transition-all"
             >
-              {h}h
+              保存
             </button>
-          ))}
+            <button
+              onClick={() => setIsEditing(false)}
+              className="flex-1 px-4 py-2.5 bg-gray-200 text-gray-700 rounded-lg font-semibold hover:bg-gray-300 transition-all"
+            >
+              取消
+            </button>
+          </div>
         </div>
       )}
 
