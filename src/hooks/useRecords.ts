@@ -11,7 +11,8 @@ import {
   subscribeCloud,
   setSyncCode,
   getSyncCode,
-  createSyncBlob
+  enableSyncWithCode,
+  isValidSyncCode
 } from '../services/syncService';
 
 const INITIAL_DATA = `5.11	9:38	21:07
@@ -103,7 +104,11 @@ export function useRecords() {
               saveRecords(cloud.records);
             }
             if (cloud.settings) {
-              const merged = { ...cloud.settings, syncCode: loadedSettings.syncCode };
+              const merged: AppSettings = {
+                weeklyTargetHours: cloud.settings.weeklyTargetHours ?? loadedSettings.weeklyTargetHours,
+                workDaysPerWeek: cloud.settings.workDaysPerWeek ?? loadedSettings.workDaysPerWeek,
+                syncCode: loadedSettings.syncCode,
+              };
               setSettings(merged);
               saveSettingsToLocal(merged);
             }
@@ -137,7 +142,11 @@ export function useRecords() {
           saveRecords(data.records);
         }
         if (data.settings) {
-          const merged = { ...data.settings, syncCode: settings.syncCode };
+          const merged: AppSettings = {
+            weeklyTargetHours: data.settings.weeklyTargetHours ?? settings.weeklyTargetHours,
+            workDaysPerWeek: data.settings.workDaysPerWeek ?? settings.workDaysPerWeek,
+            syncCode: settings.syncCode,
+          };
           setSettings(merged);
           saveSettingsToLocal(merged);
         }
@@ -208,48 +217,54 @@ export function useRecords() {
     persist(updated, settings);
   }, [records, settings, persist]);
 
-  /** 创建一个新的云端同步空间（A 设备调用），返回 syncCode */
-  const enableNewSync = useCallback(async (): Promise<string | null> => {
-    setSyncStatus('syncing');
-    const code = await createSyncBlob(records, { ...settings, syncCode: '' });
-    if (!code) {
-      setSyncStatus('offline');
-      return null;
-    }
-    setSyncCode(code);
-    const merged = { ...settings, syncCode: code };
-    setSettings(merged);
-    saveSettingsToLocal(merged);
-    setSyncStatus('synced');
-    return code;
-  }, [records, settings]);
-
-  /** 加入已有的同步空间（B 设备调用） */
-  const joinSync = useCallback(async (code: string): Promise<boolean> => {
+  /** 用自定义同步码启用同步（A 设备：上传本地数据 / 已存在则覆盖云端） */
+  const enableSyncWithUserCode = useCallback(async (code: string): Promise<{ ok: boolean; reason?: string }> => {
     const trimmed = code.trim();
-    if (!trimmed) return false;
-    setSyncCode(trimmed);
+    if (!isValidSyncCode(trimmed)) {
+      return { ok: false, reason: '同步码格式无效（4-64 位字母/数字/下划线/横线）' };
+    }
     setSyncStatus('syncing');
+    const r = await enableSyncWithCode(trimmed, records, { ...settings, syncCode: trimmed });
+    if (!r.ok) {
+      setSyncStatus('offline');
+      return r;
+    }
     const merged = { ...settings, syncCode: trimmed };
     setSettings(merged);
     saveSettingsToLocal(merged);
+    setSyncStatus('synced');
+    return { ok: true };
+  }, [records, settings]);
+
+  /** 加入已有的同步空间（B 设备：用已知同步码拉取云端数据覆盖本地） */
+  const joinSync = useCallback(async (code: string): Promise<{ ok: boolean; reason?: string }> => {
+    const trimmed = code.trim();
+    if (!isValidSyncCode(trimmed)) {
+      return { ok: false, reason: '同步码格式无效（4-64 位字母/数字/下划线/横线）' };
+    }
+    setSyncCode(trimmed);
+    setSyncStatus('syncing');
 
     const cloud = await loadDataFromCloud();
     if (!cloud) {
       setSyncStatus('offline');
-      return false;
+      return { ok: false, reason: '网络错误或同步码无效' };
     }
-    if (Array.isArray(cloud.records) && cloud.records.length >= 0) {
-      setRecords(cloud.records);
-      saveRecords(cloud.records);
+    if (cloud.updatedAtMs === 0 && cloud.records.length === 0) {
+      setSyncStatus('offline');
+      return { ok: false, reason: '该同步码在云端没有数据，请确认主设备已点击 "保存并同步"' };
     }
-    if (cloud.settings) {
-      const merged2 = { ...cloud.settings, syncCode: trimmed };
-      setSettings(merged2);
-      saveSettingsToLocal(merged2);
-    }
+    setRecords(cloud.records);
+    saveRecords(cloud.records);
+    const mergedSettings: AppSettings = {
+      weeklyTargetHours: cloud.settings.weeklyTargetHours ?? settings.weeklyTargetHours,
+      workDaysPerWeek: cloud.settings.workDaysPerWeek ?? settings.workDaysPerWeek,
+      syncCode: trimmed,
+    };
+    setSettings(mergedSettings);
+    saveSettingsToLocal(mergedSettings);
     setSyncStatus('synced');
-    return true;
+    return { ok: true };
   }, [settings]);
 
   /** 断开同步 */
@@ -296,7 +311,7 @@ export function useRecords() {
     getTodayRecord,
     importRecords,
     updateSettings,
-    enableNewSync,
+    enableSyncWithUserCode,
     joinSync,
     disableSync,
     currentSyncCode: getSyncCode()

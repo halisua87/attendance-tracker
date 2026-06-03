@@ -37,7 +37,7 @@ function getFilteredRecords(
 }
 
 export default function App() {
-  const { records, settings, syncStatus, addRecord, updateRecord, editRecord, deleteRecord, getTodayRecord, importRecords, updateSettings, enableNewSync, joinSync, disableSync } = useRecords();
+  const { records, settings, syncStatus, addRecord, updateRecord, editRecord, deleteRecord, getTodayRecord, importRecords, updateSettings, enableSyncWithUserCode, joinSync, disableSync } = useRecords();
   // 默认显示全部
   const [filterType, setFilterType] = useState<string>('all');
   const [selectedWeek, setSelectedWeek] = useState<string>(getCurrentWeekString());
@@ -143,7 +143,7 @@ export default function App() {
           settings={settings}
           syncStatus={syncStatus}
           onSettingsChange={updateSettings}
-          onEnableNewSync={enableNewSync}
+          onEnableSyncWithCode={enableSyncWithUserCode}
           onJoinSync={joinSync}
           onDisableSync={disableSync}
         />

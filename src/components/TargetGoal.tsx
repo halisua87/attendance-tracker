@@ -15,8 +15,8 @@ interface TargetGoalProps {
   settings: AppSettings;
   syncStatus?: 'idle' | 'syncing' | 'synced' | 'offline';
   onSettingsChange: (newSettings: AppSettings) => void;
-  onEnableNewSync?: () => Promise<string | null>;
-  onJoinSync?: (code: string) => Promise<boolean>;
+  onEnableSyncWithCode?: (code: string) => Promise<{ ok: boolean; reason?: string }>;
+  onJoinSync?: (code: string) => Promise<{ ok: boolean; reason?: string }>;
   onDisableSync?: () => void;
 }
 
@@ -34,7 +34,7 @@ function savePlanned(map: Record_PlannedMap) {
   localStorage.setItem(PLANNED_KEY, JSON.stringify(map));
 }
 
-export function TargetGoal({ records, settings, syncStatus = 'idle', onSettingsChange, onEnableNewSync, onJoinSync, onDisableSync }: TargetGoalProps) {
+export function TargetGoal({ records, settings, syncStatus = 'idle', onSettingsChange, onEnableSyncWithCode, onJoinSync, onDisableSync }: TargetGoalProps) {
   const [isEditing, setIsEditing] = useState(false);
   const [tempTarget, setTempTarget] = useState(settings.weeklyTargetHours.toString());
   const [tempWorkDays, setTempWorkDays] = useState((settings.workDaysPerWeek ?? 5).toString());
@@ -84,19 +84,22 @@ export function TargetGoal({ records, settings, syncStatus = 'idle', onSettingsC
   const [syncMode, setSyncMode] = useState<'menu' | 'create' | 'join'>('menu');
   const [syncBusy, setSyncBusy] = useState(false);
   const [syncMsg, setSyncMsg] = useState<string>('');
-  const [createdCode, setCreatedCode] = useState<string>('');
 
   const handleEnableNewSync = async () => {
-    if (!onEnableNewSync) return;
+    if (!onEnableSyncWithCode) return;
+    const code = tempCode.trim();
+    if (!/^[a-zA-Z0-9_-]{4,64}$/.test(code)) {
+      setSyncMsg('同步码格式不合法（4-64 位，仅允许字母、数字、下划线、横线）');
+      return;
+    }
     setSyncBusy(true);
     setSyncMsg('');
-    const code = await onEnableNewSync();
+    const r = await onEnableSyncWithCode(code);
     setSyncBusy(false);
-    if (code) {
-      setCreatedCode(code);
-      setSyncMsg('已创建同步空间，请复制下面同步码在其他设备上输入');
+    if (r.ok) {
+      setSyncMsg('保存成功！本设备数据已上传云端。在其他设备上输入同一码 「' + code + '」即可同步。');
     } else {
-      setSyncMsg('创建失败，请检查网络后重试');
+      setSyncMsg('保存失败：' + (r.reason || '未知错误'));
     }
   };
 
@@ -109,13 +112,13 @@ export function TargetGoal({ records, settings, syncStatus = 'idle', onSettingsC
     }
     setSyncBusy(true);
     setSyncMsg('');
-    const ok = await onJoinSync(code);
+    const r = await onJoinSync(code);
     setSyncBusy(false);
-    if (ok) {
+    if (r.ok) {
       setSyncMsg('已连接，数据已同步过来 ✓');
-      setTimeout(() => setShowSync(false), 1000);
+      setTimeout(() => setShowSync(false), 1200);
     } else {
-      setSyncMsg('连接失败，同步码不存在或网络不可用');
+      setSyncMsg('连接失败：' + (r.reason || '未知错误'));
     }
   };
 
@@ -123,7 +126,6 @@ export function TargetGoal({ records, settings, syncStatus = 'idle', onSettingsC
     setShowSync(true);
     setSyncMode('menu');
     setSyncMsg('');
-    setCreatedCode(settings.syncCode || '');
     setTempCode(settings.syncCode || '');
   };
 
@@ -408,17 +410,16 @@ export function TargetGoal({ records, settings, syncStatus = 'idle', onSettingsC
             ) : syncMode === 'menu' ? (
               <div className="space-y-3">
                 <p className="text-sm text-gray-600 mb-2">
-                  数据保存在云端 JSON 存储中，需要"先在一台设备生成同步码、再在其他设备粘贴该码"才能共享。
+                  数据保存在 Firebase 云端。在第一台设备上 <strong>自定义一个同步码</strong>（例如 <code className="px-1 bg-gray-100 rounded">qinjia-2026</code>）并保存，其他设备输入同一个同步码即可看到同一份数据。
                 </p>
                 <button
-                  onClick={() => { setSyncMode('create'); handleEnableNewSync(); }}
-                  disabled={syncBusy}
-                  className="w-full px-4 py-3 bg-gradient-to-r from-blue-500 to-indigo-600 text-white rounded-xl font-semibold hover:from-blue-600 hover:to-indigo-700 transition-all disabled:opacity-50"
+                  onClick={() => { setSyncMode('create'); setTempCode(''); setSyncMsg(''); }}
+                  className="w-full px-4 py-3 bg-gradient-to-r from-blue-500 to-indigo-600 text-white rounded-xl font-semibold hover:from-blue-600 hover:to-indigo-700 transition-all"
                 >
-                  {syncBusy ? '创建中...' : '我是主设备：创建新同步码'}
+                  我是主设备：创建/保存我的同步码
                 </button>
                 <button
-                  onClick={() => setSyncMode('join')}
+                  onClick={() => { setSyncMode('join'); setTempCode(''); setSyncMsg(''); }}
                   className="w-full px-4 py-3 bg-white border-2 border-blue-500 text-blue-600 rounded-xl font-semibold hover:bg-blue-50 transition-all"
                 >
                   我有同步码：连接到已有空间
@@ -432,47 +433,56 @@ export function TargetGoal({ records, settings, syncStatus = 'idle', onSettingsC
               </div>
             ) : syncMode === 'create' ? (
               <div className="space-y-4">
-                {syncBusy && <p className="text-sm text-gray-600">正在创建...</p>}
-                {createdCode && (
-                  <div className="p-4 bg-green-50 border border-green-200 rounded-xl">
-                    <div className="text-sm text-gray-600 mb-1">同步码（请妥善保存）：</div>
-                    <div className="flex items-center gap-2">
-                      <code className="flex-1 px-3 py-2 bg-white border border-green-200 rounded-lg text-sm font-mono break-all select-all">
-                        {createdCode}
-                      </code>
-                      <button
-                        onClick={() => {
-                          navigator.clipboard?.writeText(createdCode);
-                          setSyncMsg('已复制到剪贴板 ✓');
-                        }}
-                        className="px-3 py-2 bg-green-600 text-white text-xs font-semibold rounded-lg hover:bg-green-700"
-                      >
-                        复制
-                      </button>
-                    </div>
-                  </div>
-                )}
-                {syncMsg && <p className="text-sm text-blue-600">{syncMsg}</p>}
-                <button
-                  onClick={() => setShowSync(false)}
-                  className="w-full px-4 py-3 bg-gradient-to-r from-blue-500 to-indigo-600 text-white rounded-xl font-semibold hover:from-blue-600 hover:to-indigo-700 transition-all"
-                >
-                  完成
-                </button>
-              </div>
-            ) : (
-              <div className="space-y-4">
                 <p className="text-sm text-gray-600">
-                  在主设备点击"创建新同步码"后会得到一串字符（UUID 格式），把它粘贴到下面：
+                  请自定义一个 <strong>4-64 位</strong> 的同步码（仅字母、数字、下划线、横线）。建议使用昵称+数字组合，例如 <code className="px-1 bg-gray-100 rounded">qinjia-2026</code>。
                 </p>
                 <input
                   type="text"
                   value={tempCode}
-                  onChange={(e) => setTempCode(e.target.value)}
-                  placeholder="如 019e8cda-83c7-76df-..."
+                  onChange={(e) => setTempCode(e.target.value.replace(/[^a-zA-Z0-9_-]/g, ''))}
+                  placeholder="例如 qinjia-2026"
+                  maxLength={64}
                   className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-200 focus:border-blue-500"
                 />
-                {syncMsg && <p className="text-sm text-red-600">{syncMsg}</p>}
+                {syncMsg && <p className={`text-sm ${syncMsg.startsWith('保存成功') ? 'text-green-600' : 'text-red-600'}`}>{syncMsg}</p>}
+                <div className="flex gap-3">
+                  <button
+                    onClick={handleEnableNewSync}
+                    disabled={syncBusy}
+                    className="flex-1 px-4 py-3 bg-gradient-to-r from-blue-500 to-indigo-600 text-white rounded-xl font-semibold hover:from-blue-600 hover:to-indigo-700 transition-all disabled:opacity-50"
+                  >
+                    {syncBusy ? '保存中...' : '保存并同步'}
+                  </button>
+                  <button
+                    onClick={() => setSyncMode('menu')}
+                    className="px-4 py-3 bg-gray-200 text-gray-700 rounded-xl font-semibold hover:bg-gray-300 transition-all"
+                  >
+                    返回
+                  </button>
+                </div>
+                {syncMsg.startsWith('保存成功') && (
+                  <button
+                    onClick={() => setShowSync(false)}
+                    className="w-full px-4 py-2 text-sm text-blue-600 hover:text-blue-700"
+                  >
+                    完成
+                  </button>
+                )}
+              </div>
+            ) : (
+              <div className="space-y-4">
+                <p className="text-sm text-gray-600">
+                  请输入你在 <strong>主设备</strong> 上保存过的同步码：
+                </p>
+                <input
+                  type="text"
+                  value={tempCode}
+                  onChange={(e) => setTempCode(e.target.value.replace(/[^a-zA-Z0-9_-]/g, ''))}
+                  placeholder="例如 qinjia-2026"
+                  maxLength={64}
+                  className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-200 focus:border-blue-500"
+                />
+                {syncMsg && <p className={`text-sm ${syncMsg.startsWith('已连接') ? 'text-green-600' : 'text-red-600'}`}>{syncMsg}</p>}
                 <div className="flex gap-3">
                   <button
                     onClick={handleJoinSync}

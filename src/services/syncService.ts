@@ -1,15 +1,17 @@
+/**
+ * 云同步服务 —— 基于 Firebase Firestore REST API
+ *
+ * 路径：shared/{syncCode}  （由 Firestore 安全规则限制 4-64 位长度）
+ * 优点：无需 Firebase SDK（包体小）、无需登录、跨设备共享同一份数据
+ */
 import { Record } from '../types';
 
-/**
- * 基于 jsonblob.com 的免费、无需鉴权的 JSON 存储。
- * - 同步码即 blob 的 UUID。
- * - A 设备首次启用同步 → POST 创建 blob，得到 location header，提取 UUID 作为同步码返回给用户。
- * - B 设备输入同步码 → GET /api/jsonBlob/{id} 即可读到完全一样的数据。
- */
+const FIREBASE_API_KEY = 'AIzaSyAuAuIQ-P9Uvm5ermKXJe6mUYassDzsSi4Mk';
+const FIREBASE_PROJECT = 'work-2f17c';
+const BASE = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT}/databases/(default)/documents`;
 
-const SETTINGS_KEY = 'attendance_settings';
 const SYNC_CODE_KEY = 'attendance_sync_code';
-const API_BASE = 'https://jsonblob.com/api/jsonBlob';
+const SETTINGS_KEY = 'attendance_settings';
 
 export interface AppSettings {
   weeklyTargetHours: number;
@@ -20,139 +22,231 @@ export interface AppSettings {
 const DEFAULT_SETTINGS: AppSettings = {
   weeklyTargetHours: 40,
   syncCode: '',
-  workDaysPerWeek: 5
+  workDaysPerWeek: 5,
 };
 
-interface CloudPayload {
-  records: Record[];
-  settings: AppSettings;
-  updatedAtMs: number;
+/* ---------- 本地缓存 ---------- */
+export function loadSettingsFromLocal(): AppSettings {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    if (!raw) {
+      const code = localStorage.getItem(SYNC_CODE_KEY) || '';
+      return { ...DEFAULT_SETTINGS, syncCode: code };
+    }
+    const obj = JSON.parse(raw);
+    return {
+      weeklyTargetHours: typeof obj.weeklyTargetHours === 'number' ? obj.weeklyTargetHours : 40,
+      syncCode: typeof obj.syncCode === 'string' ? obj.syncCode : localStorage.getItem(SYNC_CODE_KEY) || '',
+      workDaysPerWeek: typeof obj.workDaysPerWeek === 'number' ? obj.workDaysPerWeek : 5,
+    };
+  } catch {
+    return { ...DEFAULT_SETTINGS };
+  }
+}
+
+export function saveSettingsToLocal(settings: AppSettings) {
+  localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  if (settings.syncCode) {
+    localStorage.setItem(SYNC_CODE_KEY, settings.syncCode);
+  } else {
+    localStorage.removeItem(SYNC_CODE_KEY);
+  }
 }
 
 export function getSyncCode(): string {
   return localStorage.getItem(SYNC_CODE_KEY) || '';
 }
-export function setSyncCode(code: string): void {
+
+export function setSyncCode(code: string) {
   if (code) localStorage.setItem(SYNC_CODE_KEY, code);
   else localStorage.removeItem(SYNC_CODE_KEY);
 }
 
-function isUuid(s: string) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
+/* ---------- 同步码格式校验（与 Firestore 规则一致） ---------- */
+export function normalizeSyncCode(input: string): string {
+  return input.trim().replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
+}
+export function isValidSyncCode(code: string): boolean {
+  return /^[a-zA-Z0-9_-]{4,64}$/.test(code);
 }
 
-/** 创建一个全新的同步 blob，返回同步码（UUID） */
-export async function createSyncBlob(records: Record[], settings: AppSettings): Promise<string | null> {
+/* ---------- Firestore JSON <-> 业务对象 ---------- */
+function toFsValue(v: any): any {
+  if (v === null || v === undefined) return { nullValue: null };
+  if (typeof v === 'boolean') return { booleanValue: v };
+  if (typeof v === 'number') {
+    if (Number.isInteger(v)) return { integerValue: String(v) };
+    return { doubleValue: v };
+  }
+  if (typeof v === 'string') return { stringValue: v };
+  if (Array.isArray(v)) {
+    return { arrayValue: { values: v.map(toFsValue) } };
+  }
+  if (typeof v === 'object') {
+    const fields: Record_ = {};
+    Object.keys(v).forEach((k) => { fields[k] = toFsValue(v[k]); });
+    return { mapValue: { fields } };
+  }
+  return { stringValue: String(v) };
+}
+type Record_ = { [k: string]: any };
+
+function fromFsValue(v: any): any {
+  if (!v) return null;
+  if ('nullValue' in v) return null;
+  if ('booleanValue' in v) return v.booleanValue;
+  if ('integerValue' in v) return parseInt(v.integerValue);
+  if ('doubleValue' in v) return v.doubleValue;
+  if ('stringValue' in v) return v.stringValue;
+  if ('arrayValue' in v) {
+    return (v.arrayValue.values || []).map(fromFsValue);
+  }
+  if ('mapValue' in v) {
+    const o: Record_ = {};
+    const fs = v.mapValue.fields || {};
+    Object.keys(fs).forEach((k) => { o[k] = fromFsValue(fs[k]); });
+    return o;
+  }
+  return null;
+}
+
+function packPayload(records: Record[], settings: AppSettings, updatedAtMs: number) {
+  // 整个 records 数组 JSON.stringify 存为单个字符串字段，简单可靠
+  // Firestore 单字段最大 1MB，足够
+  return {
+    fields: {
+      recordsJson: { stringValue: JSON.stringify(records) },
+      weeklyTargetHours: toFsValue(settings.weeklyTargetHours),
+      workDaysPerWeek: toFsValue(settings.workDaysPerWeek ?? 5),
+      updatedAtMs: { integerValue: String(updatedAtMs) },
+    },
+  };
+}
+
+function unpackPayload(doc: any): { records: Record[]; settings: Partial<AppSettings>; updatedAtMs: number } | null {
+  if (!doc || !doc.fields) return null;
+  const f = doc.fields;
+  let records: Record[] = [];
   try {
-    const body: CloudPayload = { records, settings, updatedAtMs: Date.now() };
-    const resp = await fetch(API_BASE, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-      body: JSON.stringify(body)
-    });
+    const raw = f.recordsJson?.stringValue || '[]';
+    records = JSON.parse(raw);
+  } catch {
+    records = [];
+  }
+  return {
+    records,
+    settings: {
+      weeklyTargetHours: f.weeklyTargetHours ? fromFsValue(f.weeklyTargetHours) : undefined,
+      workDaysPerWeek: f.workDaysPerWeek ? fromFsValue(f.workDaysPerWeek) : undefined,
+    },
+    updatedAtMs: f.updatedAtMs ? parseInt(f.updatedAtMs.integerValue) : 0,
+  };
+}
+
+/* ---------- 网络操作 ---------- */
+export async function loadDataFromCloud(): Promise<{ records: Record[]; settings: Partial<AppSettings>; updatedAtMs: number } | null> {
+  const code = getSyncCode();
+  if (!code || !isValidSyncCode(code)) return null;
+  try {
+    const url = `${BASE}/shared/${encodeURIComponent(code)}?key=${FIREBASE_API_KEY}`;
+    const resp = await fetch(url, { method: 'GET' });
+    if (resp.status === 404) {
+      // 文档不存在 = 这个 syncCode 还没有任何数据
+      return { records: [], settings: {}, updatedAtMs: 0 };
+    }
     if (!resp.ok) {
-      console.warn('[sync] create failed', resp.status);
+      console.warn('[sync] loadDataFromCloud failed', resp.status);
       return null;
     }
-    // 优先 Location header
-    const loc = resp.headers.get('Location') || resp.headers.get('location') || '';
-    const m = loc.match(/jsonBlob\/([0-9a-f-]+)/i);
-    if (m) return m[1];
-    // 部分浏览器 CORS 拿不到 Location，但有 X-jsonblob-id header
-    const xid = resp.headers.get('X-jsonblob-id') || resp.headers.get('x-jsonblob-id');
-    if (xid) return xid;
-    return null;
+    const doc = await resp.json();
+    return unpackPayload(doc);
   } catch (e) {
-    console.warn('[sync] create error', e);
+    console.warn('[sync] loadDataFromCloud error', e);
     return null;
   }
 }
 
-/** 拉取云端数据 */
-export async function loadDataFromCloud(): Promise<CloudPayload | null> {
-  const code = getSyncCode();
-  if (!code || !isUuid(code)) return null;
+let writeTimer: any = null;
+let pendingWrite: { records: Record[]; settings: AppSettings } | null = null;
+
+async function doWrite() {
+  if (!pendingWrite) return;
+  const { records, settings } = pendingWrite;
+  pendingWrite = null;
+  const code = settings.syncCode || getSyncCode();
+  if (!code || !isValidSyncCode(code)) return;
   try {
-    const resp = await fetch(`${API_BASE}/${code}`, {
-      method: 'GET',
-      headers: { 'Accept': 'application/json' },
-      cache: 'no-store'
-    });
-    if (!resp.ok) return null;
-    const data = await resp.json();
-    return {
-      records: Array.isArray(data?.records) ? data.records : [],
-      settings: data?.settings ?? DEFAULT_SETTINGS,
-      updatedAtMs: data?.updatedAtMs ?? 0
-    };
-  } catch (e) {
-    console.warn('[sync] load error', e);
-    return null;
-  }
-}
-
-let pendingTimer: ReturnType<typeof setTimeout> | null = null;
-let pendingPayload: CloudPayload | null = null;
-
-/** 上传到云端（debounced 600ms） */
-export function syncDataToCloud(records: Record[], settings: AppSettings): void {
-  pendingPayload = { records, settings, updatedAtMs: Date.now() };
-  if (pendingTimer) clearTimeout(pendingTimer);
-  pendingTimer = setTimeout(flushSync, 600);
-}
-
-async function flushSync() {
-  if (!pendingPayload) return;
-  const payload = pendingPayload;
-  pendingPayload = null;
-  pendingTimer = null;
-
-  const code = getSyncCode();
-  if (!code || !isUuid(code)) return;
-
-  try {
-    const resp = await fetch(`${API_BASE}/${code}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-      body: JSON.stringify(payload)
+    const url = `${BASE}/shared/${encodeURIComponent(code)}?key=${FIREBASE_API_KEY}`;
+    const body = packPayload(records, settings, Date.now());
+    const resp = await fetch(url, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
     });
     if (!resp.ok) {
-      console.warn('[sync] put failed', resp.status);
-    } else {
-      console.log('[sync] uploaded code=', code);
+      const t = await resp.text();
+      console.warn('[sync] write failed', resp.status, t);
     }
   } catch (e) {
-    console.warn('[sync] put error', e);
+    console.warn('[sync] write error', e);
   }
 }
 
-/** 简易"订阅"：每 15 秒轮询一次云端，如有更新则回调 */
-export function subscribeCloud(
-  onData: (data: CloudPayload) => void
-): () => void {
-  const code = getSyncCode();
-  if (!code || !isUuid(code)) return () => {};
+export function syncDataToCloud(records: Record[], settings: AppSettings) {
+  pendingWrite = { records, settings };
+  if (writeTimer) clearTimeout(writeTimer);
+  writeTimer = setTimeout(doWrite, 600);
+}
 
+/**
+ * 主设备首次启用同步 —— 用用户提供的 syncCode 创建文档，并把当前本地数据上传
+ */
+export async function enableSyncWithCode(
+  code: string,
+  records: Record[],
+  settings: AppSettings
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  if (!isValidSyncCode(code)) {
+    return { ok: false, reason: '同步码格式无效（4-64 位字母/数字/下划线/横线）' };
+  }
+  try {
+    const url = `${BASE}/shared/${encodeURIComponent(code)}?key=${FIREBASE_API_KEY}`;
+    const body = packPayload(records, { ...settings, syncCode: code }, Date.now());
+    const resp = await fetch(url, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) {
+      const t = await resp.text();
+      return { ok: false, reason: `服务器返回 ${resp.status}: ${t.slice(0, 100)}` };
+    }
+    setSyncCode(code);
+    return { ok: true };
+  } catch (e: any) {
+    return { ok: false, reason: '网络错误: ' + (e?.message || String(e)) };
+  }
+}
+
+/**
+ * 订阅云端：定时轮询（15s）+ visibilitychange 立刻拉
+ */
+export function subscribeCloud(onData: (data: { records: Record[]; settings: Partial<AppSettings>; updatedAtMs: number }) => void): () => void {
   let stopped = false;
-  let lastUpdatedMs = 0;
+  let lastUpdatedAt = 0;
 
-  const poll = async () => {
+  const tick = async () => {
     if (stopped) return;
-    try {
-      const data = await loadDataFromCloud();
-      if (data && data.updatedAtMs && data.updatedAtMs > lastUpdatedMs) {
-        lastUpdatedMs = data.updatedAtMs;
-        onData(data);
-      }
-    } catch {}
+    const d = await loadDataFromCloud();
+    if (d && d.updatedAtMs > lastUpdatedAt) {
+      lastUpdatedAt = d.updatedAtMs;
+      onData(d);
+    }
   };
 
-  // 立即拉一次 + 之后每 15s 轮询
-  poll();
-  const id = setInterval(poll, 15000);
-
-  // 页面回到前台时立即拉一次
-  const onVis = () => { if (document.visibilityState === 'visible') poll(); };
+  tick(); // 立刻拉一次
+  const id = setInterval(tick, 15000);
+  const onVis = () => { if (document.visibilityState === 'visible') tick(); };
   document.addEventListener('visibilitychange', onVis);
 
   return () => {
@@ -160,21 +254,4 @@ export function subscribeCloud(
     clearInterval(id);
     document.removeEventListener('visibilitychange', onVis);
   };
-}
-
-export function saveSettingsToLocal(settings: AppSettings): void {
-  localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
-}
-export function loadSettingsFromLocal(): AppSettings {
-  try {
-    const data = localStorage.getItem(SETTINGS_KEY);
-    const parsed = data ? JSON.parse(data) : null;
-    return {
-      ...DEFAULT_SETTINGS,
-      ...(parsed || {}),
-      syncCode: getSyncCode() || (parsed?.syncCode ?? '')
-    };
-  } catch {
-    return { ...DEFAULT_SETTINGS };
-  }
 }
